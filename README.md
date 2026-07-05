@@ -1,6 +1,6 @@
 # AI Healthcare Assistant
 
-This project upgrades the original Flask, LangChain, Pinecone medical RAG chatbot into an AI healthcare assistant with Groq chat completion, Sarvam speech input/output, Google Places healthcare provider search, and source attribution.
+This project upgrades the normal Flask, LangChain, Pinecone medical RAG chatbot into an AI healthcare assistant with Groq chat completion, Sarvam speech input/output, Google Places healthcare provider search, and source attribution.
 
 The assistant is informational only. It does not diagnose, claim certainty, or replace care from a qualified medical professional.
 
