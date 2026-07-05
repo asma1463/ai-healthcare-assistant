@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1">
+		<title>AI Healthcare Assistant</title>
+		<meta name="description" content="Ask medical questions and find nearby healthcare providers powered by AI.">
+		<link rel="preconnect" href="https://fonts.googleapis.com">
+		<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+		<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+		<link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.5.0/css/all.css">
+		<script src="https://ajax.googleapis.com/ajax/libs/jquery/3.3.1/jquery.min.js"></script>
+		<link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='style.css')}}"/>
+	</head>
+	<body>
+		<div class="page-shell">
+
+			<!-- ── App Header ──────────────────────────────────────────────── -->
+			<header class="app-header">
+				<div class="app-header-icon">
+					<img src="https://cdn-icons-png.flaticon.com/512/387/387569.png" alt="">
+				</div>
+				<div class="app-header-text">
+					<h1>AI Healthcare Assistant</h1>
+					<p id="recordingStatus">Ask about symptoms, medicines, or care options</p>
+				</div>
+			</header>
+
+			<!-- ── Chat Card ───────────────────────────────────────────────── -->
+			<main class="chat-card">
+
+				<!-- Message list -->
+				<div id="messageFormeight" aria-live="polite" aria-label="Chat messages"></div>
+
+				<!-- Error / status banner -->
+				<div id="errorBox" role="alert"></div>
+
+				<!-- Input footer -->
+				<footer class="input-footer">
+					<form id="messageArea">
+						<div class="input-row">
+							<button type="button" id="locationButton" class="icon-btn" title="Use my location" aria-label="Share location">
+								<i class="fas fa-map-marker-alt"></i>
+							</button>
+							<button type="button" id="recordButton" class="icon-btn" title="Record voice" aria-label="Record voice message">
+								<i class="fas fa-microphone"></i>
+							</button>
+							<input type="text" id="text" name="msg" placeholder="Type your message..." autocomplete="off" required aria-label="Message input">
+							<button type="submit" id="send" class="icon-btn" title="Send message" aria-label="Send">
+								<i class="fas fa-paper-plane"></i>
+							</button>
+						</div>
+					</form>
+				</footer>
+
+			</main>
+		</div>
+
+		<script>
+			$(document).ready(function() {
+				// ── Audio recording state ──────────────────────────────────────────
+				let isRecording    = false;
+				let audioCtx       = null;
+				let micSource      = null;
+				let processor      = null;
+				let micStream      = null;
+				let pcmSamples     = [];   // Float32 samples collected at native rate
+				const TARGET_RATE  = 16000; // Sarvam requires 16 kHz
+				let currentPosition = null;
+				const audioCache = new Map();
+
+				// ── Build a 16-bit PCM WAV Blob from Float32 samples ───────────────
+				function buildWav(samples, sampleRate) {
+					const numSamples = samples.length;
+					const byteLen    = 44 + numSamples * 2; // 44-byte header + 2 bytes/sample
+					const buf        = new ArrayBuffer(byteLen);
+					const view       = new DataView(buf);
+
+					// RIFF chunk
+					const w = (off, str) => { for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i)); };
+					w(0,  "RIFF"); view.setUint32( 4, byteLen - 8, true);
+					w(8,  "WAVE");
+					w(12, "fmt "); view.setUint32(16, 16, true);          // subchunk1 size
+					view.setUint16(20, 1,          true);                  // PCM
+					view.setUint16(22, 1,          true);                  // mono
+					view.setUint32(24, sampleRate, true);                  // sample rate
+					view.setUint32(28, sampleRate * 2, true);              // byte rate
+					view.setUint16(32, 2,          true);                  // block align
+					view.setUint16(34, 16,         true);                  // bits per sample
+					w(36, "data"); view.setUint32(40, numSamples * 2, true);
+
+					// Write 16-bit PCM samples
+					let offset = 44;
+					for (let i = 0; i < numSamples; i++) {
+						const s = Math.max(-1, Math.min(1, samples[i]));
+						view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+						offset += 2;
+					}
+					return new Blob([buf], { type: "audio/wav" });
+				}
+
+				// ── Downsample from srcRate → TARGET_RATE (linear interpolation) ──
+				function downsample(samples, srcRate, dstRate) {
+					if (srcRate === dstRate) return samples;
+					const ratio   = srcRate / dstRate;
+					const outLen  = Math.floor(samples.length / ratio);
+					const out     = new Float32Array(outLen);
+					for (let i = 0; i < outLen; i++) {
+						const pos  = i * ratio;
+						const lo   = Math.floor(pos);
+						const hi   = Math.min(lo + 1, samples.length - 1);
+						out[i] = samples[lo] + (samples[hi] - samples[lo]) * (pos - lo);
+					}
+					return out;
+				}
+
+				// ── Stop recording, encode WAV, upload ─────────────────────────────
+				function stopRecording() {
+					if (!isRecording) return;
+					isRecording = false;
+
+					processor.disconnect();
+					micSource.disconnect();
+					micStream.getTracks().forEach(t => t.stop());
+					audioCtx.close();
+
+					// Minimum 0.25 s of audio (4096-sample buffers at 44.1 kHz ≈ 93 ms each)
+					const MIN_SAMPLES = TARGET_RATE * 0.25; // 4000 samples @ 16 kHz
+					if (pcmSamples.length === 0) {
+						setRecording(false, "Ask about symptoms, medicines, or care options");
+						showError("Recording was too short or empty. Please hold the button and speak.");
+						return;
+					}
+
+					const totalLen = pcmSamples.reduce((s, c) => s + c.length, 0);
+					const nativeSamples = new Float32Array(totalLen);
+					let offset = 0;
+					for (const chunk of pcmSamples) {
+						nativeSamples.set(chunk, offset);
+						offset += chunk.length;
+					}
+
+					const resampled = downsample(nativeSamples, audioCtx.sampleRate, TARGET_RATE);
+
+					if (resampled.length < MIN_SAMPLES) {
+						setRecording(false, "Ask about symptoms, medicines, or care options");
+						showError("Recording was too short. Please speak for at least a second.");
+						return;
+					}
+
+					const wavBlob = buildWav(resampled, TARGET_RATE);
+					uploadRecording(wavBlob);
+				}
+
+				$("#locationButton").on("click", function() {
+					if (navigator.geolocation) {
+						navigator.geolocation.getCurrentPosition(function(position) {
+							currentPosition = {
+								latitude: position.coords.latitude,
+								longitude: position.coords.longitude
+							};
+							$("#locationButton").addClass("active_loc").css("color", "green").attr("title", "Location active");
+							showError("Location access granted.");
+						}, function() {
+							showError("Location access denied or unavailable.");
+						});
+					} else {
+						showError("Geolocation is not supported by this browser.");
+					}
+				});
+
+				$("#recordButton").on("click", async function() {
+					// Second click → stop
+					if (isRecording) {
+						stopRecording();
+						return;
+					}
+
+					try {
+						micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+						audioCtx  = new (window.AudioContext || window.webkitAudioContext)();
+
+						// ⚠️ Browsers (especially Safari/Chrome after autoplay policy) create
+						// the AudioContext in 'suspended' state. resume() is REQUIRED here;
+						// without it onaudioprocess never fires and the WAV is 0 bytes.
+						if (audioCtx.state === 'suspended') {
+							await audioCtx.resume();
+						}
+
+						micSource = audioCtx.createMediaStreamSource(micStream);
+
+						// ScriptProcessorNode — captures raw Float32 PCM
+						const bufSize = 4096;
+						processor = audioCtx.createScriptProcessor(bufSize, 1, 1);
+						pcmSamples = [];
+						processor.onaudioprocess = function(e) {
+							if (!isRecording) return;
+							// Slice (not reference) so the buffer can be GC'd
+							pcmSamples.push(e.inputBuffer.getChannelData(0).slice());
+						};
+
+						// Route: mic → processor → silent gain → destination
+						// The gain node mutes speaker output (no echo) while keeping
+						// the graph connected so onaudioprocess keeps firing.
+						const silentGain = audioCtx.createGain();
+						silentGain.gain.value = 0;
+						micSource.connect(processor);
+						processor.connect(silentGain);
+						silentGain.connect(audioCtx.destination);
+
+						isRecording = true;
+						setRecording(true);
+					} catch (err) {
+						showError("Microphone access was not available.");
+					}
+				});
+
+				$("#messageArea").on("submit", function(event) {
+					event.preventDefault();
+					const rawText = $("#text").val().trim();
+					if (!rawText) {
+						return;
+					}
+
+					const messageId = "msg-" + Date.now();
+					appendUserMessage(rawText);
+					appendLoading(messageId);
+					$("#text").val("");
+
+					const payload = { msg: rawText };
+					if (currentPosition) {
+						payload.latitude = currentPosition.latitude;
+						payload.longitude = currentPosition.longitude;
+					}
+
+					$.ajax({
+						data: payload,
+						type: "POST",
+						url: "/get",
+					}).done(function(data) {
+						$("#" + messageId).remove();
+						appendBotMessage(data);
+					}).fail(function(xhr) {
+						$("#" + messageId).remove();
+						showError(errorText(xhr, "I could not get a response right now."));
+					});
+				});
+
+				// ── Upload WAV to /transcribe ──────────────────────────────────────
+				function uploadRecording(blob) {
+					setRecording(false, "Transcribing...");
+					const formData = new FormData();
+					formData.append("audio", blob, "recording.wav"); // 16-bit PCM WAV
+
+					$.ajax({
+						url: "/transcribe",
+						type: "POST",
+						data: formData,
+						processData: false,
+						contentType: false
+					}).done(function(data) {
+						$("#text").val(data.transcript || "");
+						$("#recordingStatus").text("Transcription ready");
+					}).fail(function(xhr) {
+						showError(errorText(xhr, "Transcription failed."));
+						$("#recordingStatus").text("Ask about symptoms, medicines, or care options");
+					});
+				}
+
+				function appendUserMessage(text) {
+					const html =
+						'<div class="msg-row msg-row--user mb-4">' +
+							'<div class="msg-bubble-wrap">' +
+								'<div class="msg-bubble">' + escapeHtml(text) + '</div>' +
+								'<span class="msg-time">' + currentTime() + '</span>' +
+							'</div>' +
+							'<img src="https://i.ibb.co/d5b84Xw/Untitled-design.png" class="msg-avatar" alt="You">' +
+						'</div>';
+					appendAndScroll(html);
+				}
+
+				function appendLoading(id) {
+					const html =
+						'<div id="' + id + '" class="msg-row msg-row--bot mb-4">' +
+							'<img src="https://cdn-icons-png.flaticon.com/512/387/387569.png" class="msg-avatar" alt="Assistant">' +
+							'<div class="msg-bubble-wrap">' +
+								'<div class="msg-bubble">' +
+									'<div class="typing-indicator">' +
+										'<span class="typing_dot"></span>' +
+										'<span class="typing_dot"></span>' +
+										'<span class="typing_dot"></span>' +
+									'</div>' +
+								'</div>' +
+							'</div>' +
+						'</div>';
+					appendAndScroll(html);
+				}
+
+				function appendBotMessage(data) {
+					const answer = data.answer || "I could not find an answer in the retrieved medical context.";
+					const id = "audio-" + Date.now();
+					let content = '<div class="answer_text">' + escapeHtml(answer) + '</div>';
+
+					if (data.sources && data.sources.length) {
+						content += '<div class="sources"><strong>Sources</strong><ul>' +
+							data.sources.map(source => '<li>' + escapeHtml(source) + '</li>').join("") +
+							'</ul></div>';
+					}
+
+					if (data.recommendation && data.recommendation.message) {
+						content += '<div class="provider_note">' + escapeHtml(data.recommendation.message) + '</div>';
+					}
+
+					if (data.recommendation && data.recommendation.providers && data.recommendation.providers.length) {
+						let typeTitle = (data.recommendation.provider_type || "provider").split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+						if (typeTitle.endsWith('y')) typeTitle = typeTitle.slice(0, -1) + 'ies';
+						else typeTitle += 's';
+						content += '<div class="providers"><h5 class="mt-3 font-weight-bold">Nearby ' + escapeHtml(typeTitle) + '</h5>' + data.recommendation.providers.map(providerCard).join("") + '</div>';
+					}
+
+					const html =
+						'<div class="msg-row msg-row--bot mb-4">' +
+							'<img src="https://cdn-icons-png.flaticon.com/512/387/387569.png" class="msg-avatar" alt="Assistant">' +
+							'<div class="msg-bubble-wrap">' +
+								'<div class="msg-bubble">' + content +
+									'<button type="button" class="speak_btn" data-audio-id="' + id + '" data-text="' + encodeURIComponent(answer) + '" title="Play response" aria-label="Play response"><i class="fas fa-volume-up"></i></button>' +
+								'</div>' +
+								'<span class="msg-time">' + currentTime() + '</span>' +
+							'</div>' +
+						'</div>';
+					appendAndScroll(html);
+				}
+
+				$(document).on("click", ".speak_btn", function() {
+					const button = $(this);
+					const audioId = button.data("audio-id");
+					const text = decodeURIComponent(button.data("text"));
+
+					if (audioCache.has(audioId)) {
+						audioCache.get(audioId).play();
+						return;
+					}
+
+					button.prop("disabled", true);
+					fetch("/speak", {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({ text })
+					}).then(async response => {
+						if (!response.ok) {
+							const data = await response.json().catch(() => ({}));
+							throw new Error(data.error || "Speech playback failed.");
+						}
+						return response.blob();
+					}).then(blob => {
+						const audio = new Audio(URL.createObjectURL(blob));
+						audioCache.set(audioId, audio);
+						audio.play();
+					}).catch(error => {
+						showError(error.message);
+					}).finally(() => {
+						button.prop("disabled", false);
+					});
+				});
+
+				function providerCard(provider) {
+					const distance = provider.distance
+						? '<p class="mb-1"><i class="fas fa-route" style="font-size:11px;margin-right:4px;"></i>' + escapeHtml(provider.distance) + ' km away</p>'
+						: '';
+					const link = provider.directions_url
+						? '<a href="' + provider.directions_url + '" target="_blank" rel="noopener"><i class="fas fa-map-marked-alt"></i> Open in Google Maps</a>'
+						: '';
+					return '<div class="provider_card">' +
+						'<strong>' + escapeHtml(provider.name) + '</strong>' +
+						'<p class="mb-1"><i class="fas fa-map-marker-alt" style="font-size:11px;margin-right:4px;"></i>' + escapeHtml(provider.address || 'Address unavailable') + '</p>' +
+						distance + link +
+						'</div>';
+				}
+
+				function setRecording(isRecording, statusText) {
+					$("#recordButton").toggleClass("recording", isRecording);
+					$("#recordingStatus").text(statusText || (isRecording ? "Recording..." : "Processing recording..."));
+				}
+
+				function appendAndScroll(html) {
+					$("#messageFormeight").append($.parseHTML(html));
+					$("#messageFormeight").scrollTop($("#messageFormeight")[0].scrollHeight);
+				}
+
+				function showError(message) {
+					$("#errorBox").text(message).fadeIn(150);
+					setTimeout(function() { $("#errorBox").fadeOut(150); }, 5000);
+				}
+
+				function errorText(xhr, fallback) {
+					return (xhr.responseJSON && xhr.responseJSON.error) ? xhr.responseJSON.error : fallback;
+				}
+
+				function currentTime() {
+					return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+				}
+
+				function escapeHtml(value) {
+					return String(value).replace(/[&<>"']/g, function(match) {
+						return {
+							"&": "&amp;",
+							"<": "&lt;",
+							">": "&gt;",
+							'"': "&quot;",
+							"'": "&#039;"
+						}[match];
+					});
+				}
+			});
+		</script>
+	</body>
+</html>
