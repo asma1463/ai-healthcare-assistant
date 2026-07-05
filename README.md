@@ -152,16 +152,3 @@ The app returns friendly JSON errors for missing API keys, invalid audio files, 
 - Sarvam STT/TTS
 - Google Places API
 
-## AWS CI/CD Notes
-
-If deploying with the existing GitHub Actions workflow, update repository secrets to include:
-
-- `GROQ_API_KEY`
-- `SARVAM_API_KEY`
-- `GOOGLE_MAPS_API_KEY`
-- `PINECONE_API_KEY`
-- `PINECONE_INDEX`
-- `AWS_ACCESS_KEY_ID`
-- `AWS_SECRET_ACCESS_KEY`
-- `AWS_DEFAULT_REGION`
-- `ECR_REPO`
